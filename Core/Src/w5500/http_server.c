@@ -39,8 +39,10 @@
 /* Room for the generated response head. */
 #define HTTP_HEAD_MAX			192
 
-/* Largest formatted scalar, a dotted quad or a decimal counter. */
-#define HTTP_FMT_MAX			16
+/* Largest formatted scalar. A colon separated MAC is the widest one at
+   17 characters, and snprintf reports the length it would have needed even when
+   it truncates, so the buffer has to be able to hold the full text. */
+#define HTTP_FMT_MAX			20
 
 /* Bytes pushed into one socket per poll. The transmit buffer is 2 KB per socket;
    pacing the writes keeps a large page from starving the other connections. */
@@ -67,18 +69,21 @@
  * the segment list consumes them. The route handlers below keep the two in step.
  */
 typedef enum {
-	SEG_END = 0xFF,	/* terminates a segment list */
-	SEG_STR,			/* NUL-terminated string, normally in flash */
+	SEG_STR = 0,		/* NUL-terminated string, normally in flash */
 	SEG_SNAP,			/* next snapshot fragment of this connection */
 	SEG_MAC,			/* c->net_mac, colon separated hex */
 	SEG_IP,				/* c->net_ip, dotted quad */
 	SEG_MASK,			/* c->net_sn, dotted quad */
 	SEG_GW,				/* c->net_gw, dotted quad */
-	SEG_DNS				/* c->net_dns, dotted quad */
+	SEG_DNS,			/* c->net_dns, dotted quad */
+	SEG_END				/* terminates a segment list */
 } seg_kind_t;
 
+/* The kind is wider than a byte on purpose: the list is walked with a plain
+   comparison against the enum, so a truncated field would silently turn every
+   segment into a zero length one. */
 typedef struct {
-	uint8_t			kind;
+	uint16_t		kind;
 	const char		*str;		/* only used by SEG_STR */
 } seg_t;
 
@@ -548,35 +553,41 @@ static bool parse_request_line(http_conn_t *c, uint16_t head_len)
 	return (uint16_t) (head_len - sp2 - 1) >= 8;
 }
 
-/* Strict dotted quad: four decimal octets in 0..255 and nothing else. */
+/* Strict dotted quad: four decimal octets in 0..255, separated by exactly three
+   dots, with nothing before or after. The digit counter is per octet, otherwise
+   a legal four octet address would be rejected once four digits are consumed. */
 static bool parse_ipv4(const char *s, uint16_t len, uint8_t out[4])
 {
-	uint16_t	i	 = 0;
-	uint32_t	value = 0;
-	uint8_t		octet = 0;
-	uint8_t		digits = 0;
+	uint16_t	i = 0;
+	uint8_t		octet;
 
-	while (i < len && octet < 4) {
-		if (s[i] < '0' || s[i] > '9')
-			return false;
+	for (octet = 0; octet < 4; octet++) {
+		uint32_t	value = 0;
+		uint8_t		digits = 0;
 
-		value = value * 10 + (uint32_t) (s[i] - '0');
-		if (++digits > 3 || value > 255)
-			return false;
+		while (i < len && s[i] >= '0' && s[i] <= '9') {
+			value = value * 10 + (uint32_t) (s[i] - '0');
 
-		i++;
+			if (++digits > 3 || value > 255)
+				return false;
 
-		if (i == len || s[i] != '.') {
-			out[octet++] = (uint8_t) value;
-			value = 0;
-			digits = 0;
-			break;
+			i++;
 		}
 
-		i++;
+		if (digits == 0)
+			return false;
+
+		out[octet] = (uint8_t) value;
+
+		if (octet < 3) {
+			if (i >= len || s[i] != '.')
+				return false;
+
+			i++;
+		}
 	}
 
-	return octet == 4 && i == len;
+	return i == len;
 }
 
 /* Six hex octets, separated by ':' or '-'. */
