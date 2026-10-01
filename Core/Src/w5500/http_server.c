@@ -1537,9 +1537,12 @@ static void conn_recycle(http_conn_t *c)
 
 static void conn_step_listen(http_conn_t *c, uint32_t now)
 {
-	uint8_t sr = getSn_SR(c->sock);
+	(void) now;
 
-	if (sr == SOCK_ESTABLISHED) {
+	/* The chip keeps a listening socket in SOCK_LISTEN indefinitely, so there
+	   is nothing to time out here. Recycling it periodically would only drop
+	   connection attempts that are still in flight. */
+	if (getSn_SR(c->sock) == SOCK_ESTABLISHED) {
 		getSn_DIPR(c->sock, c->peer_ip);
 
 		conn_clear(c);
@@ -1551,9 +1554,8 @@ static void conn_step_listen(http_conn_t *c, uint32_t now)
 		return;
 	}
 
-	/* The chip abandons a listening socket after its own TCP timeout, so it has
-	   to be re-armed to keep serving the port. */
-	if (sr == SOCK_CLOSED || (now - c->last_ms) > (HTTP_SERVER_IDLE_MS * 4))
+	/* Only a socket the chip gave up on has to be re-armed. */
+	if (getSn_SR(c->sock) == SOCK_CLOSED)
 		conn_recycle(c);
 }
 
@@ -1644,10 +1646,22 @@ void http_server_poll(void)
 	uint32_t	now = HAL_GetTick();
 	uint8_t		i;
 
-	/* Arm the slots lazily. Opening a socket needs a valid SIPR, so doing it
-	   lazily also keeps the server harmless if init is called too early. */
-	if (g_conn[g_arm_cursor].state == CONN_FREE) {
-		http_conn_t *c = &g_conn[g_arm_cursor];
+	/*
+	 * Arm the idle slots lazily: opening a socket needs a valid SIPR, so doing
+	 * it lazily also keeps the server harmless if init was called too early.
+	 *
+	 * The scan starts at the rotating cursor and arms at most one slot per poll.
+	 * Advancing the cursor unconditionally matters, otherwise a slot that fails
+	 * to arm would be skipped forever once another slot is busy.
+	 */
+	for (i = 0; i < HTTP_SERVER_MAX_CONN; i++) {
+		uint8_t		idx = (uint8_t) ((g_arm_cursor + i) % HTTP_SERVER_MAX_CONN);
+		http_conn_t	*c	 = &g_conn[idx];
+
+		if (c->state != CONN_FREE)
+			continue;
+
+		g_arm_cursor = (uint8_t) ((idx + 1) % HTTP_SERVER_MAX_CONN);
 
 		if (conn_arm(c)) {
 			c->state = CONN_LISTEN;
@@ -1657,7 +1671,7 @@ void http_server_poll(void)
 				   c->sock, HTTP_SERVER_PORT);
 		}
 
-		g_arm_cursor = (uint8_t) ((g_arm_cursor + 1) % HTTP_SERVER_MAX_CONN);
+		break;
 	}
 
 	for (i = 0; i < HTTP_SERVER_MAX_CONN; i++) {
