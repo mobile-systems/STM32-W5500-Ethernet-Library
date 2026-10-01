@@ -48,8 +48,10 @@
    pacing the writes keeps a large page from starving the other connections. */
 #define HTTP_TX_BUDGET			1024
 
-/* A response body is length-limited by the 16 bit Content-Length field. */
-#define HTTP_BODY_MAX			0xFFFF
+/* A body that does not fit the length field is a programming error in a route,
+   not a client problem, so the reserved value doubles as an overflow flag. */
+#define HTTP_BODY_MAX			0xFFFE
+#define HTTP_BODY_OVERFLOW		0xFFFF
 
 /* How long the last chunk of a response may stay stuck in the transmit buffer
    before the socket is recycled anyway. */
@@ -116,6 +118,8 @@ typedef struct {
 	uint8_t			sock;
 	uint8_t			method;
 	bool			reset_pending;	/* NVIC reset once the body has drained */
+	bool			net_pending;	/* write this address once the body has drained */
+	bool			snap_overflow;	/* a snapshot fragment did not fit */
 
 	uint32_t		last_ms;		/* last progress, drives the idle timeout */
 	uint8_t			peer_ip[4];
@@ -149,6 +153,13 @@ typedef struct {
 	uint16_t		snap_off;
 	char			snap[HTTP_SERVER_SNAP_SIZE];
 	char			fmt[HTTP_FMT_MAX];
+
+	/* address to be written once the confirmation has been delivered */
+	uint8_t			pend_ip[4];
+	uint8_t			pend_sn[4];
+	uint8_t			pend_gw[4];
+	uint8_t			pend_dns[4];
+	uint8_t			pend_mac[6];
 } http_conn_t;
 
 static http_conn_t	g_conn[HTTP_SERVER_MAX_CONN];
@@ -223,6 +234,8 @@ static void conn_clear(http_conn_t *c)
 	c->snap_off			= 0;
 	c->snap[0]			= '\0';
 	c->reset_pending	= false;
+	c->net_pending		= false;
+	c->snap_overflow	= false;
 }
 
 /*
@@ -239,15 +252,23 @@ static bool snap_add(http_conn_t *c, const char *fmt, ...)
 	va_list	ap;
 	int		n;
 
-	if (c->snap_len >= sizeof(c->snap))
+	if (c->snap_len >= sizeof(c->snap)) {
+		/* The fragment is dropped and the route is answered with an error by
+		   respond(). Leaving a truncated run behind would shift every later
+		   fragment and corrupt the body. */
+		c->snap_overflow	= true;
 		return false;
+	}
 
 	va_start(ap, fmt);
 	n = vsnprintf(c->snap + c->snap_len, sizeof(c->snap) - c->snap_len, fmt, ap);
 	va_end(ap);
 
-	if (n < 0 || (size_t) n >= sizeof(c->snap) - c->snap_len)
+	if (n < 0 || (size_t) n >= sizeof(c->snap) - c->snap_len) {
+		c->snap[c->snap_len]	= '\0';
+		c->snap_overflow		= true;
 		return false;
+	}
 
 	c->snap_len += (uint16_t) n;
 	return true;
@@ -351,7 +372,7 @@ static uint16_t seg_measure(http_conn_t *c)
 
 	while (seg_load(c)) {
 		if (total + c->src_len > HTTP_BODY_MAX)
-			return HTTP_BODY_MAX;
+			return HTTP_BODY_OVERFLOW;
 
 		total += c->src_len;
 		c->seg_idx++;
@@ -1274,12 +1295,15 @@ static void respond(http_conn_t *c, uint16_t code, const char *ctype,
 	c->head_sent	= 0;
 	c->last_ms	= HAL_GetTick();
 
-	if (c->body_len == HTTP_BODY_MAX) {
-		/* A body that does not fit the length field is a programming error
-		   in a route, not a client problem. */
-		c->segs		= SEG_ERROR;
-		c->body_len	= seg_measure(c);
-		code		= 500;
+	if (c->body_len == HTTP_BODY_OVERFLOW || c->snap_overflow) {
+		/* Either a route produced a body the length field cannot express, or a
+		   status value did not fit the snapshot area. Both are internal
+		   faults, so the client is told so instead of being served a body
+		   whose length lies. */
+		c->snap_overflow	= false;
+		c->segs				= SEG_ERROR;
+		c->body_len			= seg_measure(c);
+		code				= 500;
 	}
 
 	n = snprintf(c->head, sizeof(c->head),
@@ -1352,11 +1376,20 @@ static void route_post_net(http_conn_t *c, const http_request_t *req)
 			goto invalid;
 	}
 
-	static_host_configuration(mac, ip, sn, gw, dns);
+	/*
+	 * The write is deferred to conn_recycle(). Writing SIPR while this very
+	 * connection is still open makes the controller stop matching packets for
+	 * it, so the browser would see a reset instead of the confirmation that
+	 * tells it where to go next.
+	 */
+	memcpy(c->pend_ip, ip, 4);
+	memcpy(c->pend_sn, sn, 4);
+	memcpy(c->pend_gw, gw, 4);
+	memcpy(c->pend_dns, dns, 4);
+	memcpy(c->pend_mac, mac, 6);
+	c->net_pending = true;
 
-	/* Report the new address. It is the only one the browser can reach from
-	   now on, because the controller drops connections whose local address
-	   changes underneath them. */
+	/* Report the address the device is about to take. */
 	memcpy(c->net_ip, ip, 4);
 	memcpy(c->net_sn, sn, 4);
 	memcpy(c->net_gw, gw, 4);
@@ -1468,12 +1501,29 @@ static bool conn_arm(http_conn_t *c)
 }
 
 /* Closes the socket and immediately re-arms it, because the listening socket is
-   consumed by the client it accepted. */
+   consumed by the client it accepted. A posted address is written here, with the
+   socket already closed, so the controller never has to change its own address
+   underneath a live connection. */
 static void conn_recycle(http_conn_t *c)
 {
+	bool	apply = c->net_pending;
+	uint8_t	ip[4], sn[4], gw[4], dns[4], mac[6];
+
+	memcpy(ip,  c->pend_ip,  4);
+	memcpy(sn,  c->pend_sn,  4);
+	memcpy(gw,  c->pend_gw,  4);
+	memcpy(dns, c->pend_dns, 4);
+	memcpy(mac, c->pend_mac, 6);
+
 	close(c->sock);
 
 	conn_clear(c);
+
+	if (apply) {
+		static_host_configuration(mac, ip, sn, gw, dns);
+		printf("[http] address set to %u.%u.%u.%u, the previous URL is gone\r\n",
+			   ip[0], ip[1], ip[2], ip[3]);
+	}
 
 	if (conn_arm(c)) {
 		c->state = CONN_LISTEN;
