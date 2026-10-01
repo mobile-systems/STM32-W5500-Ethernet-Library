@@ -602,8 +602,9 @@ static bool parse_mac(const char *s, uint16_t len, uint8_t out[6])
 		uint8_t nib;
 
 		if (s[i] == ':' || s[i] == '-') {
-			if (nibble == 0)
-				return false;	/* empty group */
+			/* A separator is only legal between two complete octets. */
+			if (nibble != 0 || octet == 0 || octet >= 6)
+				return false;
 
 			continue;
 		}
@@ -628,7 +629,9 @@ static bool parse_mac(const char *s, uint16_t len, uint8_t out[6])
 		}
 	}
 
-	return octet == 6 && nibble == 0;
+	/* The loop stops at six octets, so a longer string has to be rejected
+	   explicitly or its tail would be accepted as an extra separator. */
+	return octet == 6 && nibble == 0 && i == len;
 }
 
 /*
@@ -877,7 +880,7 @@ static const char DASH_ROW4[] =
 "</td></tr>\n<tr><td>MAC address</td><td>";
 
 static const char DASH_ROW5[] =
-"</td></tr>\n<tr><td>Address source</td><td>";
+"</td></tr>\n<tr><td>Address source</td><td id='mode'>";
 
 static const char DASH_ROW6[] =
 "</td></tr>\n</table></section>\n"
@@ -1163,7 +1166,9 @@ static void phy_text(char *out, size_t size)
 	uint8_t		link = 0;
 	wiz_PhyConf	conf;
 
-	if (ctlwizchip(CW_GET_PHYLINK, (void *) &link) != 0 || link != PHY_LINK_ON) {
+	/* ctlwizchip reports SOCK_OK on success and -1 on a bus failure, so the
+	   test has to look for the negative value only. */
+	if (ctlwizchip(CW_GET_PHYLINK, (void *) &link) < 0 || link != PHY_LINK_ON) {
 		snprintf(out, size, "down");
 		return;
 	}
@@ -1182,7 +1187,9 @@ static void chip_text(char *out, size_t size)
 {
 	uint8_t id[8];
 
-	if (ctlwizchip(CW_GET_ID, (void *) id) != 0) {
+	memset(id, 0, sizeof(id));
+
+	if (ctlwizchip(CW_GET_ID, (void *) id) < 0) {
 		snprintf(out, size, "unknown");
 		return;
 	}
@@ -1296,7 +1303,9 @@ static void respond(http_conn_t *c, uint16_t code, const char *ctype,
 	g_requests++;
 
 	printf("[http] %s %s -> %u (%u bytes)\r\n",
-		   c->method == METHOD_POST ? "POST" : "GET", c->target, code, c->body_len);
+		   c->method == METHOD_POST ? "POST" :
+		   c->method == METHOD_GET ? "GET" : "?",
+		   c->target, code, c->body_len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1375,6 +1384,8 @@ static void route_dispatch(http_conn_t *c, const http_request_t *req)
 		return;
 	}
 
+	/* A known path reached with the wrong method is 405, not 404: the client
+	   can fix the request instead of looking for another resource. */
 	if (c->method == METHOD_GET) {
 		if (str_eq(c->target, "/")) {
 			snapshot_dashboard(c);
@@ -1385,6 +1396,8 @@ static void route_dispatch(http_conn_t *c, const http_request_t *req)
 		} else if (str_eq(c->target, "/api/net")) {
 			snapshot_values(c);
 			respond(c, 200, "application/json", API_NET_SEGS);
+		} else if (str_eq(c->target, "/api/reboot")) {
+			respond(c, 405, "text/html; charset=utf-8", SEG_ERROR);
 		} else {
 			respond(c, 404, "text/html; charset=utf-8", SEG_NOT_FOUND);
 		}
@@ -1396,6 +1409,8 @@ static void route_dispatch(http_conn_t *c, const http_request_t *req)
 		route_post_net(c, req);
 	} else if (str_eq(c->target, "/api/reboot")) {
 		route_reboot(c);
+	} else if (str_eq(c->target, "/") || str_eq(c->target, "/api/status")) {
+		respond(c, 405, "text/html; charset=utf-8", SEG_ERROR);
 	} else {
 		respond(c, 404, "text/html; charset=utf-8", SEG_NOT_FOUND);
 	}
